@@ -6204,6 +6204,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@opentelemetry/api@npm:^1.9.1":
+  version: 1.9.1
+  resolution: "@opentelemetry/api@npm:1.9.1"
+  checksum: 10/b26032739d3c54ca99b5a2920844a1fbd4c3ee383cacbb0915e8c706a2626fe91e96feaa6e893397abe0545dc8d0a765b220aa18a31b1773176eeaf3a225e10e
+  languageName: node
+  linkType: hard
+
 "@pinojs/redact@npm:^0.4.0":
   version: 0.4.0
   resolution: "@pinojs/redact@npm:0.4.0"
@@ -23154,6 +23161,7 @@ __metadata:
     "@graphql-codegen/visitor-plugin-common": "npm:^6.2.0"
     "@graphql-eslint/eslint-plugin": "npm:^4.4.0"
     "@localrepo/prettier2-for-jest": "npm:prettier@^2"
+    "@opentelemetry/api": "npm:^1.9.1"
     "@tsconfig/node22": "npm:^22.0.5"
     "@types/jest": "npm:^30.0.0"
     "@types/jscodeshift": "npm:^17.3.0"

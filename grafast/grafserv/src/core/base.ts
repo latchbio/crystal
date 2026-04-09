@@ -44,6 +44,7 @@ import {
 } from "../middleware/graphql.ts";
 import type { OptionsFromConfig } from "../options.ts";
 import { optionsFromConfig } from "../options.ts";
+import { startActiveSpan } from "../tracer.ts";
 import { handleErrors, normalizeRequest, sleep } from "../utils.ts";
 
 const buffer404 = Buffer.from(
@@ -206,15 +207,17 @@ export class GrafservBase {
   protected processRequest(
     requestDigest: RequestDigest,
   ): PromiseOrDirect<Result | null> {
-    const { resolvedPreset } = this;
-    const event: ProcessRequestEvent = {
-      resolvedPreset,
-      requestDigest,
-      instance: this,
-    };
-    return this.middleware != null
-      ? this.middleware.run("processRequest", event, processRequestWithEvent)
-      : processRequestWithEvent(event);
+    return startActiveSpan("processRequest", async () => {
+      const { resolvedPreset } = this;
+      const event: ProcessRequestEvent = {
+        resolvedPreset,
+        requestDigest,
+        instance: this,
+      };
+      return await (this.middleware != null
+        ? this.middleware.run("processRequest", event, processRequestWithEvent)
+        : processRequestWithEvent(event));
+    });
   }
 
   public getPreset(): GraphileConfig.ResolvedPreset {
@@ -575,56 +578,60 @@ function defaultMakeGetExecutionConfig(): (
   let schemaPrepare: Promise<boolean> | null = null;
 
   return function getExecutionConfig(this: GrafservBase) {
-    // Get up to date schema, in case we're in watch mode
-    const schemaOrPromise = this.getSchema();
-    const { resolvedPreset, dynamicOptions } = this;
-    if (schemaOrPromise !== latestSchemaOrPromise) {
-      latestSchemaOrPromise = schemaOrPromise;
-      if ("then" in schemaOrPromise) {
-        schemaPrepare = (async () => {
-          latestSchema = await schemaOrPromise;
-          latestSchemaOrPromise = schemaOrPromise;
-          latestParseAndValidate = makeParseAndValidateFunction(
-            latestSchema,
-            resolvedPreset,
-            dynamicOptions,
-          );
-          schemaPrepare = null;
-          return true;
-        })();
-      } else {
-        if (latestSchema === schemaOrPromise) {
-          // No action necessary
+    return startActiveSpan("getExecutionConfig", async () => {
+      // Get up to date schema, in case we're in watch mode
+      const schemaOrPromise = this.getSchema();
+      const { resolvedPreset, dynamicOptions } = this;
+      if (schemaOrPromise !== latestSchemaOrPromise) {
+        latestSchemaOrPromise = schemaOrPromise;
+        if ("then" in schemaOrPromise) {
+          schemaPrepare = (async () => {
+            latestSchema = await schemaOrPromise;
+            latestSchemaOrPromise = schemaOrPromise;
+            latestParseAndValidate = makeParseAndValidateFunction(
+              latestSchema,
+              resolvedPreset,
+              dynamicOptions,
+            );
+            schemaPrepare = null;
+            return true;
+          })();
         } else {
-          latestSchema = schemaOrPromise;
-          latestParseAndValidate = makeParseAndValidateFunction(
-            latestSchema,
-            resolvedPreset,
-            dynamicOptions,
-          );
+          if (latestSchema === schemaOrPromise) {
+            // No action necessary
+          } else {
+            latestSchema = schemaOrPromise;
+            latestParseAndValidate = makeParseAndValidateFunction(
+              latestSchema,
+              resolvedPreset,
+              dynamicOptions,
+            );
+          }
         }
       }
-    }
-    if (schemaPrepare !== null) {
-      const sleeper = sleep(dynamicOptions.schemaWaitTime);
-      const schemaReadyPromise = Promise.race([schemaPrepare, sleeper.promise]);
-      return schemaReadyPromise.then((schemaReady) => {
-        sleeper.release();
-        if (schemaReady !== true) {
-          // Handle missing schema
-          throw new Error(`Schema isn't ready`);
-        }
-        return {
-          schema: latestSchema,
-          parseAndValidate: latestParseAndValidate,
-          resolvedPreset,
-          execute,
-          subscribe,
-          contextValue: Object.create(null),
-        };
-      });
-    }
-    /*
+      if (schemaPrepare !== null) {
+        const sleeper = sleep(dynamicOptions.schemaWaitTime);
+        const schemaReadyPromise = Promise.race([
+          schemaPrepare,
+          sleeper.promise,
+        ]);
+        return await schemaReadyPromise.then((schemaReady) => {
+          sleeper.release();
+          if (schemaReady !== true) {
+            // Handle missing schema
+            throw new Error(`Schema isn't ready`);
+          }
+          return {
+            schema: latestSchema,
+            parseAndValidate: latestParseAndValidate,
+            resolvedPreset,
+            execute,
+            subscribe,
+            contextValue: Object.create(null),
+          };
+        });
+      }
+      /*
   if (schemaOrPromise == null) {
     const err = Promise.reject(
       new GraphQLError(
@@ -642,14 +649,15 @@ function defaultMakeGetExecutionConfig(): (
     return () => err;
   }
     */
-    return {
-      schema: latestSchema,
-      parseAndValidate: latestParseAndValidate,
-      resolvedPreset,
-      execute,
-      subscribe,
-      contextValue: Object.create(null),
-    };
+      return {
+        schema: latestSchema,
+        parseAndValidate: latestParseAndValidate,
+        resolvedPreset,
+        execute,
+        subscribe,
+        contextValue: Object.create(null),
+      };
+    });
   };
 }
 

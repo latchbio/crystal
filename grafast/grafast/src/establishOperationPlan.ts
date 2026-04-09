@@ -17,6 +17,7 @@ import type {
 } from "./interfaces.ts";
 import type { GrafastOperationOptions } from "./prepare.ts";
 import { timeSource } from "./timeSource.ts";
+import { startActiveSpan } from "./tracer.ts";
 
 const debug = debugFactory("grafast:establishOperationPlan");
 
@@ -121,156 +122,169 @@ export function establishOperationPlan<
   onError: ErrorBehavior,
   options: GrafastOperationOptions,
 ): OperationPlan {
-  const planningTimeout = options.timeouts?.planning;
-  let cacheByOperation = schema.extensions.grafast?.[$$cacheByOperation];
+  return startActiveSpan("establishOperationPlan", (span) => {
+    const planningTimeout = options.timeouts?.planning;
+    let cacheByOperation = schema.extensions.grafast?.[$$cacheByOperation];
 
-  let cache = cacheByOperation?.get(operation);
+    let cache = cacheByOperation?.get(operation);
 
-  // These two variables to make it easy to trim the linked list later.
-  let count = 0;
-  let lastButOneItem: LinkedList<EstablishOperationPlanResult> | null = null;
+    span.setAttributes({
+      timeout: String(planningTimeout),
+      cached: String(cache != null),
+      "operation.type": operation.operation,
+      "operation.name": operation.name?.value ?? "",
+      "operation.description": operation.description?.value ?? "",
+    });
 
-  if (cache !== undefined) {
-    // Dev-only validation
-    assertFragmentsMatch(cache.fragments, fragments);
+    // These two variables to make it easy to trim the linked list later.
+    let count = 0;
+    let lastButOneItem: LinkedList<EstablishOperationPlanResult> | null = null;
 
-    let previousItem: LinkedList<EstablishOperationPlanResult> | null = null;
-    let linkedItem: LinkedList<EstablishOperationPlanResult> | null =
-      cache.possibleOperationPlans;
-    while (linkedItem) {
-      const value = linkedItem.value;
-      if (
-        isOperationPlanResultCompatible(
-          value,
-          variableValues,
-          context,
-          rootValue,
-          onError,
-        )
-      ) {
-        const { error, operationPlan } = value;
-        if (error != null) {
-          if (error instanceof SafeError) {
-            if (error.extensions?.[$$timeout] != null) {
-              if (error.extensions[$$ts] < timeSource.now() - TIMEOUT_TIMEOUT) {
-                // Remove this out of date timeout
-                linkedItem = linkedItem.next;
-                if (previousItem !== null) {
-                  previousItem.next = linkedItem;
-                } else {
-                  cache.possibleOperationPlans = linkedItem;
+    if (cache !== undefined) {
+      // Dev-only validation
+      assertFragmentsMatch(cache.fragments, fragments);
+
+      let previousItem: LinkedList<EstablishOperationPlanResult> | null = null;
+      let linkedItem: LinkedList<EstablishOperationPlanResult> | null =
+        cache.possibleOperationPlans;
+      while (linkedItem) {
+        const value = linkedItem.value;
+        if (
+          isOperationPlanResultCompatible(
+            value,
+            variableValues,
+            context,
+            rootValue,
+            onError,
+          )
+        ) {
+          const { error, operationPlan } = value;
+          if (error != null) {
+            if (error instanceof SafeError) {
+              if (error.extensions?.[$$timeout] != null) {
+                if (
+                  error.extensions[$$ts] <
+                  timeSource.now() - TIMEOUT_TIMEOUT
+                ) {
+                  // Remove this out of date timeout
+                  linkedItem = linkedItem.next;
+                  if (previousItem !== null) {
+                    previousItem.next = linkedItem;
+                  } else {
+                    cache.possibleOperationPlans = linkedItem;
+                  }
+                  continue;
                 }
-                continue;
-              }
-              if (
-                planningTimeout != null &&
-                error.extensions[$$timeout] >= planningTimeout
-              ) {
-                // It was a timeout error - do not retry
-                throw error;
+                if (
+                  planningTimeout != null &&
+                  error.extensions[$$timeout] >= planningTimeout
+                ) {
+                  // It was a timeout error - do not retry
+                  throw error;
+                } else {
+                  // That's Not My Timeout, let's try again.
+                }
               } else {
-                // That's Not My Timeout, let's try again.
+                // Not a timeout error - this will always fail in the same way?
+                throw error;
               }
             } else {
               // Not a timeout error - this will always fail in the same way?
               throw error;
             }
           } else {
-            // Not a timeout error - this will always fail in the same way?
-            throw error;
-          }
-        } else {
-          // Hoist to top of linked list
-          if (previousItem !== null) {
-            // Remove linkedItem from existing chain
-            previousItem.next = linkedItem.next;
-            // Add rest of chain after linkedItem
-            linkedItem.next = cache.possibleOperationPlans;
-            // linkedItem is now head of chain
-            cache.possibleOperationPlans = linkedItem;
-          }
+            // Hoist to top of linked list
+            if (previousItem !== null) {
+              // Remove linkedItem from existing chain
+              previousItem.next = linkedItem.next;
+              // Add rest of chain after linkedItem
+              linkedItem.next = cache.possibleOperationPlans;
+              // linkedItem is now head of chain
+              cache.possibleOperationPlans = linkedItem;
+            }
 
-          // We found a suitable OperationPlan - use that!
-          return operationPlan;
+            // We found a suitable OperationPlan - use that!
+            return operationPlan;
+          }
         }
+
+        count++;
+        lastButOneItem = previousItem;
+        previousItem = linkedItem;
+        linkedItem = linkedItem.next;
+      }
+    }
+
+    // No suitable OperationPlan found, time to make one.
+    let operationPlan: OperationPlan | undefined;
+    let error: EstablishOperationPlanResult["error"] | undefined;
+    const variableValuesConstraints: Constraint[] = [];
+    const contextConstraints: Constraint[] = [];
+    const rootValueConstraints: Constraint[] = [];
+    try {
+      operationPlan = new OperationPlan(
+        schema,
+        operation,
+        fragments,
+        variableValuesConstraints,
+        variableValues,
+        contextConstraints,
+        context,
+        rootValueConstraints,
+        rootValue,
+        onError,
+        options,
+      );
+    } catch (e) {
+      error = e;
+    }
+
+    // Store it to the cache
+    if (!cacheByOperation) {
+      if (!schema.extensions.grafast) {
+        (schema.extensions as any).grafast = Object.create(null);
+      }
+      cacheByOperation = new LRU({
+        maxLength: schema.extensions.grafast!.operationsCacheMaxLength ?? 500,
+      });
+      schema.extensions.grafast![$$cacheByOperation] = cacheByOperation;
+    }
+    const establishOperationPlanResult: EstablishOperationPlanResult = {
+      variableValuesConstraints,
+      contextConstraints,
+      rootValueConstraints,
+      errorBehavior: onError,
+      ...(operationPlan ? { operationPlan } : { error: error! }),
+    };
+    if (!cache) {
+      cache = {
+        fragments,
+        possibleOperationPlans: {
+          value: establishOperationPlanResult,
+          next: null,
+        },
+      };
+      cacheByOperation.set(operation, cache);
+    } else {
+      const max =
+        schema.extensions.grafast!.operationOperationPlansCacheMaxLength ?? 50;
+      if (count >= max) {
+        // Remove the tail to ensure we never grow too big
+        lastButOneItem!.next = null;
+        count--;
+        // LOGGING: we should announce this so that people know there's something that needs fixing in their schema (too much eval?)
       }
 
-      count++;
-      lastButOneItem = previousItem;
-      previousItem = linkedItem;
-      linkedItem = linkedItem.next;
-    }
-  }
-
-  // No suitable OperationPlan found, time to make one.
-  let operationPlan: OperationPlan | undefined;
-  let error: EstablishOperationPlanResult["error"] | undefined;
-  const variableValuesConstraints: Constraint[] = [];
-  const contextConstraints: Constraint[] = [];
-  const rootValueConstraints: Constraint[] = [];
-  try {
-    operationPlan = new OperationPlan(
-      schema,
-      operation,
-      fragments,
-      variableValuesConstraints,
-      variableValues,
-      contextConstraints,
-      context,
-      rootValueConstraints,
-      rootValue,
-      onError,
-      options,
-    );
-  } catch (e) {
-    error = e;
-  }
-
-  // Store it to the cache
-  if (!cacheByOperation) {
-    if (!schema.extensions.grafast) {
-      (schema.extensions as any).grafast = Object.create(null);
-    }
-    cacheByOperation = new LRU({
-      maxLength: schema.extensions.grafast!.operationsCacheMaxLength ?? 500,
-    });
-    schema.extensions.grafast![$$cacheByOperation] = cacheByOperation;
-  }
-  const establishOperationPlanResult: EstablishOperationPlanResult = {
-    variableValuesConstraints,
-    contextConstraints,
-    rootValueConstraints,
-    errorBehavior: onError,
-    ...(operationPlan ? { operationPlan } : { error: error! }),
-  };
-  if (!cache) {
-    cache = {
-      fragments,
-      possibleOperationPlans: {
+      // Add new operationPlan to top of the linked list.
+      cache.possibleOperationPlans = {
         value: establishOperationPlanResult,
-        next: null,
-      },
-    };
-    cacheByOperation.set(operation, cache);
-  } else {
-    const max =
-      schema.extensions.grafast!.operationOperationPlansCacheMaxLength ?? 50;
-    if (count >= max) {
-      // Remove the tail to ensure we never grow too big
-      lastButOneItem!.next = null;
-      count--;
-      // LOGGING: we should announce this so that people know there's something that needs fixing in their schema (too much eval?)
+        next: cache.possibleOperationPlans,
+      };
     }
-
-    // Add new operationPlan to top of the linked list.
-    cache.possibleOperationPlans = {
-      value: establishOperationPlanResult,
-      next: cache.possibleOperationPlans,
-    };
-  }
-  if (error !== undefined) {
-    throw error;
-  } else {
-    return operationPlan!;
-  }
+    if (error !== undefined) {
+      throw error;
+    } else {
+      return operationPlan!;
+    }
+  });
 }

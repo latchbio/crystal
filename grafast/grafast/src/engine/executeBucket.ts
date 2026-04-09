@@ -37,6 +37,7 @@ import type { Step, UnbatchedStep } from "../step.ts";
 import { __ItemStep } from "../steps/__item.ts";
 import { __ValueStep } from "../steps/__value.ts";
 import { timeSource } from "../timeSource.ts";
+import { startActiveSpan } from "../tracer.ts";
 import {
   arrayOfLength,
   isPhaseTransitionLayerPlan,
@@ -102,6 +103,16 @@ function mergeErrorsBackIn(
 
 /** @internal */
 export function executeBucket(
+  bucket: Bucket,
+  requestContext: RequestTools,
+): PromiseOrDirect<void> {
+  return startActiveSpan(`executeBucket:${bucket.toString?.()}`, () =>
+    _executeBucket(bucket, requestContext),
+  );
+}
+
+/** @internal */
+function _executeBucket(
   bucket: Bucket,
   requestContext: RequestTools,
 ): PromiseOrDirect<void> {
@@ -1421,7 +1432,7 @@ export function newBucket(
     // Do not copy state across phase transitions
     isPhaseTransitionLayerPlan(spec.layerPlan)
       ? makeSharedState(spec.layerPlan)
-      : (parent?.sharedState ?? makeSharedState(spec.layerPlan));
+      : parent?.sharedState ?? makeSharedState(spec.layerPlan);
   if (isDev) {
     // Some validations
     if (!(spec.size > 0)) {
@@ -1721,7 +1732,9 @@ function makeIndexForEach(count: number) {
   return result;
 }
 function executeStepFromEvent(event: ExecuteStepEvent) {
-  return event.step.execute(event.executeDetails);
+  return startActiveSpan(`executeStepFromEvent:${event.step}`, () =>
+    event.step.execute(event.executeDetails),
+  );
 }
 
 function evaluateStream(
@@ -1735,13 +1748,13 @@ function evaluateStream(
   const shouldStream =
     stream === true || stream.ifStepId == null
       ? true
-      : (bucket.store.get(stream.ifStepId)?.unaryValue() ?? true);
+      : bucket.store.get(stream.ifStepId)?.unaryValue() ?? true;
   if (!shouldStream) return null;
 
   const initialCount =
     stream === true || stream.initialCountStepId == null
       ? 0
-      : (bucket.store.get(stream.initialCountStepId)?.unaryValue() ?? 0);
+      : bucket.store.get(stream.initialCountStepId)?.unaryValue() ?? 0;
   if (initialCount >= distributorOptions.distributorTargetBufferSize) {
     // Streaming this would cause a delay, so let's just fetch it all up front.
     // (Really a user should have a validation cap on the maximum size of an

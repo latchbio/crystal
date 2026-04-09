@@ -32,6 +32,7 @@ import type {
 } from "../executor.ts";
 import type { MakePgServiceOptions } from "../interfaces.ts";
 import type { PgAdaptor } from "../pgServices.ts";
+import { startActiveSpan } from "../tracer.ts.ts";
 
 declare global {
   namespace Grafast {
@@ -341,32 +342,33 @@ export function makePgAdaptorWithPgClient(
   const withPgClient: WithPgClient<NodePostgresPgClient> = async (
     pgSettings,
     callback,
-  ) => {
-    const pgClient = await pool.connect();
-    if (!pgClient[$$isSetup]) {
-      pgClient[$$isSetup] = true;
-      if (!DONT_DISABLE_JIT) {
-        // We don't actually disable JIT, it's the optimization that's expensive so we disable that.
-        pgClient.query("set jit_optimize_above_cost = -1;").catch((e) => {
-          console.error(
-            `Error occurred applying @dataplan/pg global Postgres settings: ${e}`,
-          );
-        });
+  ) =>
+    startActiveSpan("withPgClient", async () => {
+      const pgClient = await pool.connect();
+      if (!pgClient[$$isSetup]) {
+        pgClient[$$isSetup] = true;
+        if (!DONT_DISABLE_JIT) {
+          // We don't actually disable JIT, it's the optimization that's expensive so we disable that.
+          pgClient.query("set jit_optimize_above_cost = -1;").catch((e) => {
+            console.error(
+              `Error occurred applying @dataplan/pg global Postgres settings: ${e}`,
+            );
+          });
+        }
       }
-    }
-    try {
-      return await makeNodePostgresWithPgClient_inner(
-        pgClient,
-        pgSettings,
-        callback,
-        false,
-        false,
-      );
-    } finally {
-      // NOTE: have decided not to `RESET ALL` here; otherwise timezone,jit,etc will reset
-      pgClient.release();
-    }
-  };
+      try {
+        return await makeNodePostgresWithPgClient_inner(
+          pgClient,
+          pgSettings,
+          callback,
+          false,
+          false,
+        );
+      } finally {
+        // NOTE: have decided not to `RESET ALL` here; otherwise timezone,jit,etc will reset
+        pgClient.release();
+      }
+    });
 
   let released = false;
   const releaseOnce = () => {
@@ -395,16 +397,17 @@ export function makeWithPgClientViaPgClientAlreadyInTransaction(
   const withPgClient: WithPgClient<NodePostgresPgClient> = async (
     pgSettings,
     callback,
-  ) => {
-    return makeNodePostgresWithPgClient_inner(
-      pgClient,
-      pgSettings,
-      callback,
-      // Ensure only one withPgClient can run at a time, since we only have on pgClient.
-      true,
-      alreadyInTransaction,
-    );
-  };
+  ) =>
+    startActiveSpan("withPgClient", async () => {
+      return makeNodePostgresWithPgClient_inner(
+        pgClient,
+        pgSettings,
+        callback,
+        // Ensure only one withPgClient can run at a time, since we only have on pgClient.
+        true,
+        alreadyInTransaction,
+      );
+    });
 
   let released = false;
   const releaseOnce = () => {

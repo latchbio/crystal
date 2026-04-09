@@ -22,6 +22,7 @@ import type {
 } from "./interfaces.ts";
 import { $$normalizedHeaders } from "./interfaces.ts";
 import { validateGraphQLBody } from "./middleware/graphql.ts";
+import { startActiveSpan } from "./tracer.ts";
 
 const { GraphQLError } = graphql;
 
@@ -376,28 +377,30 @@ export function makeGraphQLWSConfig(instance: GrafservBase): ServerOptions {
 export function parseGraphQLJSONBody(
   params: JSONValue | (SubscribePayload & { id?: string; documentId?: string }),
 ): ParsedGraphQLBody {
-  if (!params) {
-    throw httpError(400, "No body");
-  }
-  if (typeof params !== "object" || Array.isArray(params)) {
-    throw httpError(400, "Invalid body; expected object");
-  }
-  const id = params.id;
-  const documentId = params.documentId;
-  const query = params.query;
-  const operationName = params.operationName ?? undefined;
-  const variableValues = params.variables ?? undefined;
-  const onError = (params as any).onError ?? undefined;
-  const extensions = params.extensions ?? undefined;
-  return {
-    id,
-    documentId,
-    query,
-    operationName,
-    variableValues,
-    onError,
-    extensions,
-  };
+  return startActiveSpan("parseGraphQLJSONBody", () => {
+    if (!params) {
+      throw httpError(400, "No body");
+    }
+    if (typeof params !== "object" || Array.isArray(params)) {
+      throw httpError(400, "Invalid body; expected object");
+    }
+    const id = params.id;
+    const documentId = params.documentId;
+    const query = params.query;
+    const operationName = params.operationName ?? undefined;
+    const variableValues = params.variables ?? undefined;
+    const onError = (params as any).onError ?? undefined;
+    const extensions = params.extensions ?? undefined;
+    return {
+      id,
+      documentId,
+      query,
+      operationName,
+      variableValues,
+      onError,
+      extensions,
+    };
+  });
 }
 
 export async function concatBufferIterator(

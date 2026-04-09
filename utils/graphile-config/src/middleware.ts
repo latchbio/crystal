@@ -3,7 +3,7 @@ import type {
   FunctionalityObject,
   PromiseOrDirect,
 } from "./interfaces.ts";
-import { isPromiseLike } from "./utils.ts";
+import { isPromiseLike, startActiveSpan } from "./utils.ts";
 
 export interface MiddlewareNext<TRawResult> {
   (): TRawResult;
@@ -105,7 +105,7 @@ export class Middleware<TActivities extends FunctionalityObject<TActivities>> {
   }
 }
 
-function executeMiddleware<
+const executeMiddleware = <
   TActivities extends FunctionalityObject<TActivities>,
   TActivityName extends keyof TActivities,
 >(
@@ -118,32 +118,33 @@ function executeMiddleware<
   arg: ActivityParameter<TActivities, TActivityName>,
   idx: number,
   maxIdx: number,
-): ReturnType<ActivityFn<TActivities, TActivityName>> {
-  const next = makeNext<ReturnType<ActivityFn<TActivities, TActivityName>>>(
-    idx === maxIdx
-      ? () => activity(arg)
-      : () =>
-          executeMiddleware(
-            activityName,
-            allowAsync,
-            middlewareList,
-            activity,
-            arg,
-            idx + 1,
-            maxIdx,
-          ),
-  );
-  const middleware = middlewareList[idx];
-  const result = middleware(next as MiddlewareNext<unknown>, arg) as any;
-  if (!allowAsync && isPromiseLike(result)) {
-    throw new Error(
-      `'${String(
-        activityName,
-      )}' is a synchronous activity, all middleware must be synchronous but the middleware at index ${idx} returned a promise.`,
+): ReturnType<ActivityFn<TActivities, TActivityName>> =>
+  startActiveSpan(`executeMiddleware:${String(activityName)}`, () => {
+    const next = makeNext<ReturnType<ActivityFn<TActivities, TActivityName>>>(
+      idx === maxIdx
+        ? () => activity(arg)
+        : () =>
+            executeMiddleware(
+              activityName,
+              allowAsync,
+              middlewareList,
+              activity,
+              arg,
+              idx + 1,
+              maxIdx,
+            ),
     );
-  }
-  return result;
-}
+    const middleware = middlewareList[idx];
+    const result = middleware(next as MiddlewareNext<unknown>, arg) as any;
+    if (!allowAsync && isPromiseLike(result)) {
+      throw new Error(
+        `'${String(
+          activityName,
+        )}' is a synchronous activity, all middleware must be synchronous but the middleware at index ${idx} returned a promise.`,
+      );
+    }
+    return result;
+  });
 
 function makeNext<TRawResult>(
   fn: () => TRawResult,

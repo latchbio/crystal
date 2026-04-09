@@ -18,6 +18,7 @@ import type {
 import { getGrafastMiddleware } from "./middleware.ts";
 import type { GrafastOperationOptions } from "./prepare.ts";
 import { grafastPrepare } from "./prepare.ts";
+import { startActiveSpan } from "./tracer.ts";
 import { isPromiseLike } from "./utils.ts";
 
 /**
@@ -29,71 +30,79 @@ export function withGrafastArgs(
 ): PromiseOrValue<
   ExecutionResult | AsyncGenerator<AsyncExecutionResult, void, void>
 > {
-  const options = args.resolvedPreset?.grafast;
-  if (isDev) {
-    if (
-      args.rootValue != null &&
-      (typeof args.rootValue !== "object" ||
-        Object.keys(args.rootValue).length > 0)
-    ) {
-      throw new Error(
-        `Grafast executor doesn't support there being a rootValue (found ${inspect(
-          args.rootValue,
-        )})`,
-      );
-    }
-  }
-  if (args.rootValue == null) {
-    args.rootValue = Object.create(null);
-  }
-  if (typeof args.rootValue !== "object" || args.rootValue == null) {
-    throw new Error("Grafast requires that the 'rootValue' be an object");
-  }
-  const explain = options?.explain;
-  const shouldExplain = !!explain;
-
-  let unlisten: (() => void) | null = null;
-  if (shouldExplain) {
-    const eventEmitter: ExecutionEventEmitter | undefined = new EventEmitter();
-    const explainOperations: any[] = [];
-    args.rootValue = Object.assign(Object.create(null), args.rootValue, {
-      [$$eventEmitter]: eventEmitter,
-      [$$extensions]: {
-        explain: {
-          operations: explainOperations,
-        },
-      },
-    });
-    const handleExplainOperation = ({
-      operation,
-    }: ExecutionEventMap["explainOperation"]) => {
-      if (explain === true || (explain && explain.includes(operation.type))) {
-        explainOperations.push(operation);
+  return startActiveSpan("withGrafastArgs", (span) => {
+    const options = args.resolvedPreset?.grafast;
+    if (isDev) {
+      if (
+        args.rootValue != null &&
+        (typeof args.rootValue !== "object" ||
+          Object.keys(args.rootValue).length > 0)
+      ) {
+        throw new Error(
+          `Grafast executor doesn't support there being a rootValue (found ${inspect(
+            args.rootValue,
+          )})`,
+        );
       }
-    };
-    eventEmitter!.on("explainOperation", handleExplainOperation);
-    unlisten = () => {
-      eventEmitter!.removeListener("explainOperation", handleExplainOperation);
-    };
-  }
+    }
+    if (args.rootValue == null) {
+      args.rootValue = Object.create(null);
+    }
+    if (typeof args.rootValue !== "object" || args.rootValue == null) {
+      throw new Error("Grafast requires that the 'rootValue' be an object");
+    }
+    const explain = options?.explain;
+    const shouldExplain = !!explain;
 
-  const operationOptions: RequireAllKeys<GrafastOperationOptions> = {
-    explain: options?.explain,
-    timeouts: options?.timeouts,
-    maxPlanningDepth: options?.maxPlanningDepth,
-    // TODO: Delete this
-    outputDataAsString: args.outputDataAsString,
-  };
-  const rootValue = grafastPrepare(args, operationOptions);
-  if (unlisten !== null) {
-    Promise.resolve(rootValue).then(unlisten, unlisten);
-  }
-  // Convert from PromiseOrDirect to PromiseOrValue
-  if (isPromiseLike(rootValue)) {
-    return Promise.resolve(rootValue);
-  } else {
-    return rootValue;
-  }
+    span.setAttribute("shouldExplain", String(explain));
+
+    let unlisten: (() => void) | null = null;
+    if (shouldExplain) {
+      const eventEmitter: ExecutionEventEmitter | undefined =
+        new EventEmitter();
+      const explainOperations: any[] = [];
+      args.rootValue = Object.assign(Object.create(null), args.rootValue, {
+        [$$eventEmitter]: eventEmitter,
+        [$$extensions]: {
+          explain: {
+            operations: explainOperations,
+          },
+        },
+      });
+      const handleExplainOperation = ({
+        operation,
+      }: ExecutionEventMap["explainOperation"]) => {
+        if (explain === true || (explain && explain.includes(operation.type))) {
+          explainOperations.push(operation);
+        }
+      };
+      eventEmitter!.on("explainOperation", handleExplainOperation);
+      unlisten = () => {
+        eventEmitter!.removeListener(
+          "explainOperation",
+          handleExplainOperation,
+        );
+      };
+    }
+
+    const operationOptions: RequireAllKeys<GrafastOperationOptions> = {
+      explain: options?.explain,
+      timeouts: options?.timeouts,
+      maxPlanningDepth: options?.maxPlanningDepth,
+      // TODO: Delete this
+      outputDataAsString: args.outputDataAsString,
+    };
+    const rootValue = grafastPrepare(args, operationOptions);
+    if (unlisten !== null) {
+      Promise.resolve(rootValue).then(unlisten, unlisten);
+    }
+    // Convert from PromiseOrDirect to PromiseOrValue
+    if (isPromiseLike(rootValue)) {
+      return Promise.resolve(rootValue);
+    } else {
+      return rootValue;
+    }
+  });
 }
 
 /**
@@ -123,27 +132,29 @@ export function execute(
 ): PromiseOrValue<
   ExecutionResult | AsyncGenerator<AsyncExecutionResult, void, undefined>
 > {
-  // TODO: remove legacy compatibility
-  if (legacyResolvedPreset !== undefined) {
-    args.resolvedPreset = legacyResolvedPreset;
-  }
-  if (legacyOutputDataAsString !== undefined) {
-    args.outputDataAsString = legacyOutputDataAsString;
-  }
+  return startActiveSpan("execute", () => {
+    // TODO: remove legacy compatibility
+    if (legacyResolvedPreset !== undefined) {
+      args.resolvedPreset = legacyResolvedPreset;
+    }
+    if (legacyOutputDataAsString !== undefined) {
+      args.outputDataAsString = legacyOutputDataAsString;
+    }
 
-  const { resolvedPreset } = args;
-  const middleware =
-    args.middleware === undefined && resolvedPreset != null
-      ? getGrafastMiddleware(resolvedPreset)
-      : (args.middleware ?? null);
-  if (args.middleware === undefined) {
-    args.middleware = middleware;
-  }
-  if (middleware !== null) {
-    return middleware.run("execute", { args }, executeMiddlewareCallback);
-  } else {
-    return withGrafastArgs(args);
-  }
+    const { resolvedPreset } = args;
+    const middleware =
+      args.middleware === undefined && resolvedPreset != null
+        ? getGrafastMiddleware(resolvedPreset)
+        : args.middleware ?? null;
+    if (args.middleware === undefined) {
+      args.middleware = middleware;
+    }
+    if (middleware !== null) {
+      return middleware.run("execute", { args }, executeMiddlewareCallback);
+    } else {
+      return withGrafastArgs(args);
+    }
+  });
 }
 
 const executeMiddlewareCallback = (event: ExecuteEvent) =>

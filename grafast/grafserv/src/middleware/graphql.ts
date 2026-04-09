@@ -29,19 +29,22 @@ import type {
   ValidatedGraphQLBody,
 } from "../interfaces.ts";
 import { $$normalizedHeaders } from "../interfaces.ts";
+import { startActiveSpan } from "../tracer.ts";
 import { httpError, noop, parseGraphQLJSONBody } from "../utils.ts";
 
 const { getOperationAST, GraphQLError, parse, Source, validate } = graphql;
 
 let lastString: string;
 let lastHash: string;
-const calculateQueryHash = (queryString: string): string => {
-  if (queryString !== lastString) {
-    lastString = queryString;
-    lastHash = createHash("sha1").update(queryString).digest("base64");
-  }
-  return lastHash;
-};
+const calculateQueryHash = (queryString: string): string =>
+  startActiveSpan("calculateQueryHash", (span) => {
+    if (queryString !== lastString) {
+      lastString = queryString;
+      lastHash = createHash("sha1").update(queryString).digest("base64");
+    }
+    span.setAttribute("lastHash", lastHash);
+    return lastHash;
+  });
 
 export function makeParseAndValidateFunction(
   schema: GraphQLSchema,
@@ -61,69 +64,72 @@ export function makeParseAndValidateFunction(
   let lastParseAndValidateQuery: string;
   let lastParseAndValidateResult: ParseAndValidateResult;
   function parseAndValidate(query: string): ParseAndValidateResult {
-    if (lastParseAndValidateQuery === query) {
-      return lastParseAndValidateResult;
-    }
-    const hash = query.length > 500 ? calculateQueryHash(query) : query;
+    return startActiveSpan("parseAndValidate", () => {
+      if (lastParseAndValidateQuery === query) {
+        return lastParseAndValidateResult;
+      }
+      const hash = query.length > 500 ? calculateQueryHash(query) : query;
 
-    const cached = parseAndValidationCache?.get(hash);
-    if (cached !== undefined) {
-      lastParseAndValidateQuery = query;
-      lastParseAndValidateResult = cached;
-      return cached;
-    }
+      const cached = parseAndValidationCache?.get(hash);
+      if (cached !== undefined) {
+        lastParseAndValidateQuery = query;
+        lastParseAndValidateResult = cached;
+        return cached;
+      }
 
-    const source = new Source(query, "GraphQL HTTP Request");
-    let document;
-    try {
-      document = parse(source);
-    } catch (e) {
-      const result = { errors: [e] };
+      const source = new Source(query, "GraphQL HTTP Request");
+      let document;
+      try {
+        document = parse(source);
+      } catch (e) {
+        const result = { errors: [e] };
+        parseAndValidationCache?.set(hash, result);
+        lastParseAndValidateQuery = query;
+        lastParseAndValidateResult = result;
+        return result;
+      }
+      const errors = validate(schema, document, dynamicOptions.validationRules);
+      const result: ParseAndValidateResult = errors.length
+        ? { errors }
+        : { document };
       parseAndValidationCache?.set(hash, result);
       lastParseAndValidateQuery = query;
       lastParseAndValidateResult = result;
       return result;
-    }
-    const errors = validate(schema, document, dynamicOptions.validationRules);
-    const result: ParseAndValidateResult = errors.length
-      ? { errors }
-      : { document };
-    parseAndValidationCache?.set(hash, result);
-    lastParseAndValidateQuery = query;
-    lastParseAndValidateResult = result;
-    return result;
+    });
   }
   return parseAndValidate;
 }
 
-function parseGraphQLQueryParams(
+const parseGraphQLQueryParams = (
   params: Record<string, string | string[] | undefined>,
-): ParsedGraphQLBody {
-  const id = params.id;
-  const documentId = params.documentId;
-  const query = params.query;
-  const operationName = params.operationName ?? undefined;
-  const variablesString = params.variables ?? undefined;
-  const variableValues =
-    typeof variablesString === "string"
-      ? JSON.parse(variablesString)
-      : undefined;
-  const onError = params.onError ?? undefined;
-  const extensionsString = params.extensions ?? undefined;
-  const extensions =
-    typeof extensionsString === "string"
-      ? JSON.parse(extensionsString)
-      : undefined;
-  return {
-    id,
-    documentId,
-    query,
-    operationName,
-    variableValues,
-    onError,
-    extensions,
-  };
-}
+): ParsedGraphQLBody =>
+  startActiveSpan("parseGraphQLQueryParams", () => {
+    const id = params.id;
+    const documentId = params.documentId;
+    const query = params.query;
+    const operationName = params.operationName ?? undefined;
+    const variablesString = params.variables ?? undefined;
+    const variableValues =
+      typeof variablesString === "string"
+        ? JSON.parse(variablesString)
+        : undefined;
+    const onError = params.onError ?? undefined;
+    const extensionsString = params.extensions ?? undefined;
+    const extensions =
+      typeof extensionsString === "string"
+        ? JSON.parse(extensionsString)
+        : undefined;
+    return {
+      id,
+      documentId,
+      query,
+      operationName,
+      variableValues,
+      onError,
+      extensions,
+    };
+  });
 
 /**
  * The default allowed request content types do not include
@@ -142,114 +148,129 @@ export const DEFAULT_ALLOWED_REQUEST_CONTENT_TYPES = Object.freeze([
   // 'multipart/form-data'
 ]) satisfies readonly RequestContentType[];
 
-function parseGraphQLBody(
+const parseGraphQLBody = (
   resolvedPreset: GraphileConfig.ResolvedPreset,
   request: NormalizedRequestDigest,
   body: GrafservBody,
-): ParsedGraphQLBody {
-  const supportedContentTypes =
-    resolvedPreset.grafserv?.allowedRequestContentTypes ??
-    DEFAULT_ALLOWED_REQUEST_CONTENT_TYPES;
-  const contentType = request[$$normalizedHeaders]["content-type"];
-  if (!contentType) {
-    throw httpError(400, "Could not determine the Content-Type of the request");
-  }
-  const semi = contentType.indexOf(";");
-  const rawContentType =
-    semi >= 0 ? contentType.slice(0, semi).trim() : contentType.trim();
-
-  if (!(supportedContentTypes as string[]).includes(rawContentType)) {
-    throw httpError(415, `Media type '${rawContentType}' is not allowed`);
-  }
-  const ct = rawContentType as RequestContentType;
-
-  // FIXME: we should probably at least look at the parameters... e.g. throw if encoding !== utf-8
-
-  switch (ct) {
-    case "application/json": {
-      switch (body.type) {
-        case "buffer": {
-          return parseGraphQLJSONBody(JSON.parse(body.buffer.toString("utf8")));
-        }
-        case "text": {
-          return parseGraphQLJSONBody(JSON.parse(body.text));
-        }
-        case "json": {
-          return parseGraphQLJSONBody(body.json);
-        }
-        default: {
-          const never: never = body;
-          throw httpError(400, `Do not understand type ${(never as any).type}`);
-        }
-      }
+): ParsedGraphQLBody =>
+  startActiveSpan("parseGraphQLBody", () => {
+    const supportedContentTypes =
+      resolvedPreset.grafserv?.allowedRequestContentTypes ??
+      DEFAULT_ALLOWED_REQUEST_CONTENT_TYPES;
+    const contentType = request[$$normalizedHeaders]["content-type"];
+    if (!contentType) {
+      throw httpError(
+        400,
+        "Could not determine the Content-Type of the request",
+      );
     }
-    case "application/x-www-form-urlencoded": {
-      switch (body.type) {
-        case "buffer": {
-          return parseGraphQLQueryParams(
-            parseGraphQLQueryString(body.buffer.toString("utf8")),
-          );
-        }
-        case "text": {
-          return parseGraphQLQueryParams(parseGraphQLQueryString(body.text));
-        }
-        case "json": {
-          if (
-            body.json == null ||
-            typeof body.json !== "object" ||
-            Array.isArray(body.json)
-          ) {
-            throw httpError(400, `Invalid body`);
+    const semi = contentType.indexOf(";");
+    const rawContentType =
+      semi >= 0 ? contentType.slice(0, semi).trim() : contentType.trim();
+
+    if (!(supportedContentTypes as string[]).includes(rawContentType)) {
+      throw httpError(415, `Media type '${rawContentType}' is not allowed`);
+    }
+    const ct = rawContentType as RequestContentType;
+
+    // FIXME: we should probably at least look at the parameters... e.g. throw if encoding !== utf-8
+
+    switch (ct) {
+      case "application/json": {
+        switch (body.type) {
+          case "buffer": {
+            return parseGraphQLJSONBody(
+              JSON.parse(body.buffer.toString("utf8")),
+            );
           }
-          return parseGraphQLQueryParams(body.json as Record<string, any>);
-        }
-        default: {
-          const never: never = body;
-          throw httpError(400, `Do not understand type ${(never as any).type}`);
-        }
-      }
-    }
-    case "application/graphql": {
-      // ENHANCE: I have a vague feeling that people that do this pass variables via the query string?
-      switch (body.type) {
-        case "text": {
-          return {
-            id: undefined,
-            documentId: undefined,
-            query: body.text,
-            operationName: undefined,
-            variableValues: undefined,
-            onError: undefined,
-            extensions: undefined,
-          };
-        }
-        case "buffer": {
-          return {
-            id: undefined,
-            documentId: undefined,
-            query: body.buffer.toString("utf8"),
-            operationName: undefined,
-            variableValues: undefined,
-            onError: undefined,
-            extensions: undefined,
-          };
-        }
-        case "json": {
-          // ERRORS: non-standard; perhaps raise a warning?
-          return parseGraphQLJSONBody(body.json);
-        }
-        default: {
-          const never: never = body;
-          throw httpError(400, `Do not understand type ${(never as any).type}`);
+          case "text": {
+            return parseGraphQLJSONBody(JSON.parse(body.text));
+          }
+          case "json": {
+            return parseGraphQLJSONBody(body.json);
+          }
+          default: {
+            const never: never = body;
+            throw httpError(
+              400,
+              `Do not understand type ${(never as any).type}`,
+            );
+          }
         }
       }
+      case "application/x-www-form-urlencoded": {
+        switch (body.type) {
+          case "buffer": {
+            return parseGraphQLQueryParams(
+              parseGraphQLQueryString(body.buffer.toString("utf8")),
+            );
+          }
+          case "text": {
+            return parseGraphQLQueryParams(parseGraphQLQueryString(body.text));
+          }
+          case "json": {
+            if (
+              body.json == null ||
+              typeof body.json !== "object" ||
+              Array.isArray(body.json)
+            ) {
+              throw httpError(400, `Invalid body`);
+            }
+            return parseGraphQLQueryParams(body.json as Record<string, any>);
+          }
+          default: {
+            const never: never = body;
+            throw httpError(
+              400,
+              `Do not understand type ${(never as any).type}`,
+            );
+          }
+        }
+      }
+      case "application/graphql": {
+        // ENHANCE: I have a vague feeling that people that do this pass variables via the query string?
+        switch (body.type) {
+          case "text": {
+            return {
+              id: undefined,
+              documentId: undefined,
+              query: body.text,
+              operationName: undefined,
+              variableValues: undefined,
+              onError: undefined,
+              extensions: undefined,
+            };
+          }
+          case "buffer": {
+            return {
+              id: undefined,
+              documentId: undefined,
+              query: body.buffer.toString("utf8"),
+              operationName: undefined,
+              variableValues: undefined,
+              onError: undefined,
+              extensions: undefined,
+            };
+          }
+          case "json": {
+            // ERRORS: non-standard; perhaps raise a warning?
+            return parseGraphQLJSONBody(body.json);
+          }
+          default: {
+            const never: never = body;
+            throw httpError(
+              400,
+              `Do not understand type ${(never as any).type}`,
+            );
+          }
+        }
+      }
+      default: {
+        const never: never = ct;
+        throw httpError(415, `Media type '${never}' is not understood`);
+      }
     }
-    default: {
-      const never: never = ct;
-      throw httpError(415, `Media type '${never}' is not understood`);
-    }
-  }
-}
+  });
 
 export const APPLICATION_JSON = "application/json;charset=utf-8";
 export const APPLICATION_GRAPHQL_RESPONSE_JSON =
@@ -274,36 +295,39 @@ const graphqlOrHTMLAcceptMatcher = makeAcceptMatcher([
 export function validateGraphQLBody(
   parsed: ParsedGraphQLBody,
 ): ValidatedGraphQLBody {
-  const { query, operationName, variableValues, onError, extensions } = parsed;
+  return startActiveSpan("validateGraphQLBody", () => {
+    const { query, operationName, variableValues, onError, extensions } =
+      parsed;
 
-  if (typeof query !== "string") {
-    throw httpError(400, "query must be a string");
-  }
-  if (operationName != null && typeof operationName !== "string") {
-    throw httpError(400, "operationName, if given, must be a string");
-  }
-  if (
-    variableValues != null &&
-    (typeof variableValues !== "object" || Array.isArray(variableValues))
-  ) {
-    throw httpError(400, "Invalid variables; expected JSON-encoded object");
-  }
-  if (
-    onError != null &&
-    !GraphQLSpecifiedErrorBehaviors.includes(onError as ErrorBehavior)
-  ) {
-    throw httpError(
-      400,
-      `Invalid onError; supported error behaviors are: ${GraphQLSpecifiedErrorBehaviors.join(", ")}`,
-    );
-  }
-  if (
-    extensions != null &&
-    (typeof extensions !== "object" || Array.isArray(extensions))
-  ) {
-    throw httpError(400, "Invalid extensions; expected JSON-encoded object");
-  }
-  return parsed as ValidatedGraphQLBody;
+    if (typeof query !== "string") {
+      throw httpError(400, "query must be a string");
+    }
+    if (operationName != null && typeof operationName !== "string") {
+      throw httpError(400, "operationName, if given, must be a string");
+    }
+    if (
+      variableValues != null &&
+      (typeof variableValues !== "object" || Array.isArray(variableValues))
+    ) {
+      throw httpError(400, "Invalid variables; expected JSON-encoded object");
+    }
+    if (
+      onError != null &&
+      !GraphQLSpecifiedErrorBehaviors.includes(onError as ErrorBehavior)
+    ) {
+      throw httpError(
+        400,
+        `Invalid onError; supported error behaviors are: ${GraphQLSpecifiedErrorBehaviors.join(", ")}`,
+      );
+    }
+    if (
+      extensions != null &&
+      (typeof extensions !== "object" || Array.isArray(extensions))
+    ) {
+      throw httpError(400, "Invalid extensions; expected JSON-encoded object");
+    }
+    return parsed as ValidatedGraphQLBody;
+  });
 }
 
 const _makeGraphQLHandlerInternal = (instance: GrafservBase) => {
@@ -315,222 +339,234 @@ const _makeGraphQLHandlerInternal = (instance: GrafservBase) => {
     graphiqlHandler?: (
       request: NormalizedRequestDigest,
     ) => PromiseOrDirect<HandlerResult | null>,
-  ): Promise<HandlerResult | null> => {
-    const accept = request[$$normalizedHeaders].accept;
-    // Do they want HTML, or do they want GraphQL?
-    const chosenContentType =
-      request.method === "GET" &&
-      dynamicOptions.graphiqlOnGraphQLGET &&
-      graphiqlHandler
-        ? graphqlOrHTMLAcceptMatcher(accept)
-        : graphqlAcceptMatcher(accept);
+  ) =>
+    await startActiveSpan(
+      "graphQLHandlerInternal",
+      async (): Promise<HandlerResult | null> => {
+        const accept = request[$$normalizedHeaders].accept;
+        // Do they want HTML, or do they want GraphQL?
+        const chosenContentType =
+          request.method === "GET" &&
+          dynamicOptions.graphiqlOnGraphQLGET &&
+          graphiqlHandler
+            ? graphqlOrHTMLAcceptMatcher(accept)
+            : graphqlAcceptMatcher(accept);
 
-    if (chosenContentType === TEXT_HTML) {
-      // They want HTML -> Ruru
-      return graphiqlHandler!(request);
-    } else if (
-      chosenContentType === APPLICATION_JSON ||
-      chosenContentType === APPLICATION_GRAPHQL_RESPONSE_JSON
-    ) {
-      // They want GraphQL
-      if (
-        request.method === "POST" ||
-        (dynamicOptions.graphqlOverGET && request.method === "GET")
-      ) {
-        /* continue */
-      } else {
-        return {
-          type: "graphql",
-          request,
-          dynamicOptions,
-          statusCode: 405,
-          contentType: "application/json",
-          payload: {
-            errors: [new GraphQLError("Method not supported, please use POST")],
-          },
-        };
-      }
-    } else {
-      // > Respond with a 406 Not Acceptable status code and stop processing the request.
-      // https://graphql.github.io/graphql-over-http/draft/#sel-DANHELDAACNA4rR
+        if (chosenContentType === TEXT_HTML) {
+          // They want HTML -> Ruru
+          return graphiqlHandler!(request);
+        } else if (
+          chosenContentType === APPLICATION_JSON ||
+          chosenContentType === APPLICATION_GRAPHQL_RESPONSE_JSON
+        ) {
+          // They want GraphQL
+          if (
+            request.method === "POST" ||
+            (dynamicOptions.graphqlOverGET && request.method === "GET")
+          ) {
+            /* continue */
+          } else {
+            return {
+              type: "graphql",
+              request,
+              dynamicOptions,
+              statusCode: 405,
+              contentType: "application/json",
+              payload: {
+                errors: [
+                  new GraphQLError("Method not supported, please use POST"),
+                ],
+              },
+            };
+          }
+        } else {
+          // > Respond with a 406 Not Acceptable status code and stop processing the request.
+          // https://graphql.github.io/graphql-over-http/draft/#sel-DANHELDAACNA4rR
 
-      return {
-        type: "graphql",
-        request,
-        dynamicOptions,
-        statusCode: 406,
-        contentType: "application/json",
-        payload: {
-          errors: [
-            new GraphQLError(
-              "Could not find a supported media type; consider adding 'application/json' or 'application/graphql-response+json' to your Accept header.",
-            ),
-          ],
-        },
-      };
-    }
-
-    // If we get here, we're handling a GraphQL request
-    const isLegacy = chosenContentType === APPLICATION_JSON;
-
-    let body: ValidatedGraphQLBody;
-    try {
-      // Read the body
-      const parsedBody =
-        request.method === "POST"
-          ? parseGraphQLBody(resolvedPreset, request, await request.getBody())
-          : parseGraphQLQueryParams(await request.getQueryParams());
-
-      // Apply our middleware (if any) to the body (they will mutate the body in place)
-      if (
-        middleware != null &&
-        middleware.middleware.processGraphQLRequestBody != null
-      ) {
-        const hookResult = middleware.run(
-          "processGraphQLRequestBody",
-          {
-            resolvedPreset,
-            body: parsedBody,
+          return {
+            type: "graphql",
             request,
-          },
-          noop,
-        );
-        if (hookResult != null) {
-          await hookResult;
+            dynamicOptions,
+            statusCode: 406,
+            contentType: "application/json",
+            payload: {
+              errors: [
+                new GraphQLError(
+                  "Could not find a supported media type; consider adding 'application/json' or 'application/graphql-response+json' to your Accept header.",
+                ),
+              ],
+            },
+          };
         }
-      }
 
-      // Validate that the body is of the right shape
-      body = validateGraphQLBody(parsedBody);
-    } catch (e) {
-      if (e instanceof SafeError) {
-        throw e;
-      } else if (
-        typeof e.statusCode === "number" &&
-        e.statusCode >= 400 &&
-        e.statusCode < 600
-      ) {
-        throw e;
-      } else {
-        // ENHANCE: should maybe handle more specific issues here. See examples:
-        // https://graphql.github.io/graphql-over-http/draft/#sec-application-json.Examples
-        throw httpError(
-          400,
-          `Parsing failed, please check that the data you're sending to the server is correct`,
-        );
-      }
-    }
+        // If we get here, we're handling a GraphQL request
+        const isLegacy = chosenContentType === APPLICATION_JSON;
 
-    const grafastCtx: Partial<Grafast.RequestContext> = {
-      ...request.requestContext,
-      http: request,
-    };
+        let body: ValidatedGraphQLBody;
+        try {
+          // Read the body
+          const parsedBody =
+            request.method === "POST"
+              ? parseGraphQLBody(
+                  resolvedPreset,
+                  request,
+                  await request.getBody(),
+                )
+              : parseGraphQLQueryParams(await request.getQueryParams());
 
-    const {
-      schema,
-      parseAndValidate,
-      execute,
-      // subscribe,
-      contextValue,
-      // dynamicOptions?
-    } = await instance.getExecutionConfig(grafastCtx);
-    const outputDataAsString = dynamicOptions.outputDataAsString;
-    const { maskIterator, maskPayload, maskError } = dynamicOptions;
+          // Apply our middleware (if any) to the body (they will mutate the body in place)
+          if (
+            middleware != null &&
+            middleware.middleware.processGraphQLRequestBody != null
+          ) {
+            const hookResult = middleware.run(
+              "processGraphQLRequestBody",
+              {
+                resolvedPreset,
+                body: parsedBody,
+                request,
+              },
+              noop,
+            );
+            if (hookResult != null) {
+              await hookResult;
+            }
+          }
 
-    const { query, operationName, variableValues, onError } = body;
-    const { errors, document } = parseAndValidate(query);
+          // Validate that the body is of the right shape
+          body = validateGraphQLBody(parsedBody);
+        } catch (e) {
+          if (e instanceof SafeError) {
+            throw e;
+          } else if (
+            typeof e.statusCode === "number" &&
+            e.statusCode >= 400 &&
+            e.statusCode < 600
+          ) {
+            throw e;
+          } else {
+            // ENHANCE: should maybe handle more specific issues here. See examples:
+            // https://graphql.github.io/graphql-over-http/draft/#sec-application-json.Examples
+            throw httpError(
+              400,
+              `Parsing failed, please check that the data you're sending to the server is correct`,
+            );
+          }
+        }
 
-    if (errors !== undefined) {
-      return {
-        type: "graphql",
-        request,
-        dynamicOptions,
-        statusCode: isLegacy ? 200 : 400,
-        contentType: chosenContentType,
-        payload: { errors },
-      };
-    }
-
-    if (request.method !== "POST") {
-      // Forbid mutation
-      const operation = getOperationAST(document, operationName);
-      if (!operation || operation.operation !== "query") {
-        const error = new GraphQLError(
-          "Only queries may take place over non-POST requests.",
-          operation,
-        );
-        return {
-          type: "graphql",
-          request,
-          dynamicOptions,
-          // Note: the GraphQL-over-HTTP spec currently mandates 405, even for legacy clients:
-          // https://graphql.github.io/graphql-over-http/draft/#sel-FALJRPCE2BCGoBitR
-          statusCode: 405,
-          contentType: chosenContentType,
-          payload: {
-            errors: [error],
-          },
+        const grafastCtx: Partial<Grafast.RequestContext> = {
+          ...request.requestContext,
+          http: request,
         };
-      }
-    }
 
-    const args: GrafastExecutionArgs = {
-      schema,
-      document,
-      rootValue: null,
-      contextValue,
-      variableValues,
-      operationName,
-      onError,
-      resolvedPreset,
-      requestContext: grafastCtx,
-      middleware: grafastMiddleware,
-    };
+        const {
+          schema,
+          parseAndValidate,
+          execute,
+          // subscribe,
+          contextValue,
+          // dynamicOptions?
+        } = await instance.getExecutionConfig(grafastCtx);
+        const outputDataAsString = dynamicOptions.outputDataAsString;
+        const { maskIterator, maskPayload, maskError } = dynamicOptions;
 
-    try {
-      await hookArgs(args);
-      const result = await execute(args);
-      if (isAsyncIterable(result)) {
-        return {
-          type: "graphqlIncremental",
-          request,
-          dynamicOptions,
-          statusCode: 200,
-          iterator: maskIterator(result),
-          outputDataAsString,
+        const { query, operationName, variableValues, onError } = body;
+        const { errors, document } = parseAndValidate(query);
+
+        if (errors !== undefined) {
+          return {
+            type: "graphql",
+            request,
+            dynamicOptions,
+            statusCode: isLegacy ? 200 : 400,
+            contentType: chosenContentType,
+            payload: { errors },
+          };
+        }
+
+        if (request.method !== "POST") {
+          // Forbid mutation
+          const operation = startActiveSpan("getOperationAST", () =>
+            getOperationAST(document, operationName),
+          );
+          if (!operation || operation.operation !== "query") {
+            const error = new GraphQLError(
+              "Only queries may take place over non-POST requests.",
+              operation,
+            );
+            return {
+              type: "graphql",
+              request,
+              dynamicOptions,
+              // Note: the GraphQL-over-HTTP spec currently mandates 405, even for legacy clients:
+              // https://graphql.github.io/graphql-over-http/draft/#sel-FALJRPCE2BCGoBitR
+              statusCode: 405,
+              contentType: chosenContentType,
+              payload: {
+                errors: [error],
+              },
+            };
+          }
+        }
+
+        const args: GrafastExecutionArgs = {
+          schema,
+          document,
+          rootValue: null,
+          contextValue,
+          variableValues,
+          operationName,
+          onError,
+          resolvedPreset,
+          requestContext: grafastCtx,
+          middleware: grafastMiddleware,
         };
-      }
-      return {
-        type: "graphql",
-        request,
-        dynamicOptions,
-        statusCode:
-          isLegacy || !result.errors
-            ? 200
-            : result.data === undefined
-              ? 400
-              : 200,
-        contentType: chosenContentType,
-        payload: maskPayload(result),
-        outputDataAsString,
-      };
-    } catch (e) {
-      console.error(e);
-      return {
-        type: "graphql",
-        request,
-        dynamicOptions,
-        // e.g. We should always return 400 on no Content-Type header:
-        // https://graphql.github.io/graphql-over-http/draft/#sel-DALLDJAADLCA8tb
-        statusCode: e.statusCode ?? (isLegacy ? 200 : 500),
-        contentType: chosenContentType,
-        payload: {
-          errors: [maskError(new GraphQLError(e.message))],
-          extensions: (args.rootValue as any)?.[$$extensions],
-        },
-      };
-    }
-  };
+
+        try {
+          await hookArgs(args);
+          const result = await execute(args);
+          if (isAsyncIterable(result)) {
+            return {
+              type: "graphqlIncremental",
+              request,
+              dynamicOptions,
+              statusCode: 200,
+              iterator: maskIterator(result),
+              outputDataAsString,
+            };
+          }
+          return {
+            type: "graphql",
+            request,
+            dynamicOptions,
+            statusCode:
+              isLegacy || !result.errors
+                ? 200
+                : result.data === undefined
+                  ? 400
+                  : 200,
+            contentType: chosenContentType,
+            payload: maskPayload(result),
+            outputDataAsString,
+          };
+        } catch (e) {
+          console.error(e);
+          return {
+            type: "graphql",
+            request,
+            dynamicOptions,
+            // e.g. We should always return 400 on no Content-Type header:
+            // https://graphql.github.io/graphql-over-http/draft/#sel-DALLDJAADLCA8tb
+            statusCode: e.statusCode ?? (isLegacy ? 200 : 500),
+            contentType: chosenContentType,
+            payload: {
+              errors: [maskError(new GraphQLError(e.message))],
+              extensions: (args.rootValue as any)?.[$$extensions],
+            },
+          };
+        }
+      },
+    );
 };
 
 export const makeGraphQLHandler = (instance: GrafservBase) => {

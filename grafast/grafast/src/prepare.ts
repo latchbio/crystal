@@ -51,6 +51,7 @@ import type {
 } from "./interfaces.ts";
 import { promiseWithResolve } from "./promiseWithResolve.ts";
 import { timeSource } from "./timeSource.ts";
+import { startActiveSpan } from "./tracer.ts";
 import {
   arrayOfLength,
   asyncIteratorWithCleanup,
@@ -318,7 +319,7 @@ function outputBucket(
   }
 }
 
-function executePreemptive(
+const executePreemptive = (
   args: GrafastExecutionArgs,
   operationPlan: OperationPlan,
   variableValues: any,
@@ -330,251 +331,254 @@ function executePreemptive(
   abortSignal: AbortSignal,
 ): PromiseOrDirect<
   ExecutionResult | AsyncGenerator<AsyncExecutionResult, void, void>
-> {
-  const rootBucketIndex = 0;
-  const size = 1;
+> =>
+  startActiveSpan("executePreemptive", () => {
+    const rootBucketIndex = 0;
+    const size = 1;
 
-  const polymorphicPathList = [POLYMORPHIC_ROOT_PATH];
-  const iterators: Array<Set<AsyncIterator<any> | Iterator<any>>> = [new Set()];
+    const polymorphicPathList = [POLYMORPHIC_ROOT_PATH];
+    const iterators: Array<Set<AsyncIterator<any> | Iterator<any>>> = [
+      new Set(),
+    ];
 
-  const store: Bucket["store"] = new Map();
-  store.set(
-    operationPlan.variableValuesStep.id,
-    unaryExecutionValue(variableValues),
-  );
-  store.set(operationPlan.contextStep.id, unaryExecutionValue(context));
-  store.set(operationPlan.rootValueStep.id, unaryExecutionValue(rootValue));
-
-  const rootBucket = newBucket(null, {
-    layerPlan: operationPlan.rootLayerPlan,
-    size,
-    store,
-    flagUnion: NO_FLAGS,
-    polymorphicPathList,
-    polymorphicType: null,
-    iterators,
-  });
-  const startTime = timeSource.now();
-  const stopTime =
-    executionTimeout !== null ? startTime + executionTimeout : null;
-  const requestContext: RequestTools = {
-    args,
-    onError,
-    startTime,
-    stopTime,
-    // toSerialize: [],
-    eventEmitter: rootValue?.[$$eventEmitter],
-    abortSignal,
-    insideGraphQL: false,
-  };
-
-  const bucketPromise = executeBucket(rootBucket, requestContext);
-
-  const subscriptionLayerPlan = rootBucket.layerPlan.children.find(
-    (c) => c.reason.type === "subscription",
-  );
-
-  function executeStreamPayload(
-    payload: any,
-    index: number,
-  ): PromiseOrDirect<ExecutionResult | AsyncGenerator<AsyncExecutionResult>> {
-    const layerPlan = subscriptionLayerPlan!;
-    const { rootStep } = layerPlan;
-    // PERF: we could consider batching this.
     const store: Bucket["store"] = new Map();
-    const ZERO = 0;
+    store.set(
+      operationPlan.variableValuesStep.id,
+      unaryExecutionValue(variableValues),
+    );
+    store.set(operationPlan.contextStep.id, unaryExecutionValue(context));
+    store.set(operationPlan.rootValueStep.id, unaryExecutionValue(rootValue));
 
-    for (const depId of layerPlan.copyStepIds) {
-      const executionVal = rootBucket.store.get(depId)!;
-      // Normally this would need scaling, but not this time since we know it only represents a single entry
-      store.set(depId, executionVal);
+    const rootBucket = newBucket(null, {
+      layerPlan: operationPlan.rootLayerPlan,
+      size,
+      store,
+      flagUnion: NO_FLAGS,
+      polymorphicPathList,
+      polymorphicType: null,
+      iterators,
+    });
+    const startTime = timeSource.now();
+    const stopTime =
+      executionTimeout !== null ? startTime + executionTimeout : null;
+    const requestContext: RequestTools = {
+      args,
+      onError,
+      startTime,
+      stopTime,
+      // toSerialize: [],
+      eventEmitter: rootValue?.[$$eventEmitter],
+      abortSignal,
+      insideGraphQL: false,
+    };
+
+    const bucketPromise = executeBucket(rootBucket, requestContext);
+
+    const subscriptionLayerPlan = rootBucket.layerPlan.children.find(
+      (c) => c.reason.type === "subscription",
+    );
+
+    function executeStreamPayload(
+      payload: any,
+      index: number,
+    ): PromiseOrDirect<ExecutionResult | AsyncGenerator<AsyncExecutionResult>> {
+      const layerPlan = subscriptionLayerPlan!;
+      const { rootStep } = layerPlan;
+      // PERF: we could consider batching this.
+      const store: Bucket["store"] = new Map();
+      const ZERO = 0;
+
+      for (const depId of layerPlan.copyStepIds) {
+        const executionVal = rootBucket.store.get(depId)!;
+        // Normally this would need scaling, but not this time since we know it only represents a single entry
+        store.set(depId, executionVal);
+      }
+
+      const rootExecutionValue = rootStep!._isUnary
+        ? unaryExecutionValue(payload)
+        : batchExecutionValue([payload]);
+      store.set(rootStep!.id, rootExecutionValue);
+
+      const subscriptionBucket = newBucket(rootBucket, {
+        layerPlan,
+        store,
+        flagUnion: rootBucket.flagUnion,
+        polymorphicPathList: [POLYMORPHIC_ROOT_PATH],
+        polymorphicType: null,
+        iterators: [new Set()],
+        size: 1, //store.size
+      });
+      const bucketPromise = executeBucket(subscriptionBucket, requestContext);
+      function outputStreamBucket() {
+        // NOTE: this is the root output plan for a subscription operation.
+        const [ctx, result] = outputBucket(
+          operationPlan.rootOutputPlan,
+          subscriptionBucket,
+          ZERO,
+          requestContext,
+          [],
+          rootBucket.store
+            .get(operationPlan.variableValuesStep.id)!
+            .at(rootBucketIndex),
+          outputDataAsString,
+        );
+        return finalize(
+          result,
+          ctx,
+          index === 0 ? rootValue[$$extensions] ?? undefined : undefined,
+          outputDataAsString,
+        );
+      }
+      if (isPromiseLike(bucketPromise)) {
+        return bucketPromise.then(outputStreamBucket);
+      } else {
+        return outputStreamBucket();
+      }
     }
 
-    const rootExecutionValue = rootStep!._isUnary
-      ? unaryExecutionValue(payload)
-      : batchExecutionValue([payload]);
-    store.set(rootStep!.id, rootExecutionValue);
+    function output() {
+      // Later we'll need to loop
 
-    const subscriptionBucket = newBucket(rootBucket, {
-      layerPlan,
-      store,
-      flagUnion: rootBucket.flagUnion,
-      polymorphicPathList: [POLYMORPHIC_ROOT_PATH],
-      polymorphicType: null,
-      iterators: [new Set()],
-      size: 1, //store.size
-    });
-    const bucketPromise = executeBucket(subscriptionBucket, requestContext);
-    function outputStreamBucket() {
-      // NOTE: this is the root output plan for a subscription operation.
+      // If it's a subscription we need to use the stream
+      const bucketRootEValue =
+        rootBucket.layerPlan.rootStep != null &&
+        rootBucket.layerPlan.rootStep.id != null
+          ? rootBucket.store.get(rootBucket.layerPlan.rootStep.id)!
+          : null;
+      const bucketRootValue = bucketRootEValue?.at(rootBucketIndex);
+      const bucketRootFlags =
+        bucketRootEValue?._flagsAt(rootBucketIndex) ?? NO_FLAGS;
+      if (bucketRootFlags & FLAG_ERROR) {
+        releaseUnusedIterators(rootBucket, rootBucketIndex, null);
+        // Something major went wrong!
+        const errors = [
+          new GraphQLError(
+            bucketRootValue.message,
+            operationPlan.rootOutputPlan.locationDetails.node, // node
+            undefined, // source
+            null, // positions
+            null, // path
+            bucketRootValue, // originalError
+            null, // extensions
+          ),
+        ];
+        const payload = Object.create(null) as ExecutionResult;
+        payload.errors = errors;
+        const extensions = bucketRootValue[$$extensions];
+        if (extensions != null) {
+          payload.extensions = extensions;
+        }
+        return payload;
+      }
+
+      // NOTE: this is where we determine whether to stream or not
+      if (
+        bucketRootValue != null &&
+        subscriptionLayerPlan != null &&
+        Array.isArray(bucketRootValue) &&
+        (bucketRootValue as StreamMaybeMoreableArray)[$$streamMore]
+      ) {
+        // We expect exactly one streamable, we should not need to
+        // `releaseUnusedIterators(rootBucket, rootBucketIndex, null)` here.
+        const arr = bucketRootValue as StreamMoreableArray;
+        const stream = arr[$$streamMore];
+        // Do the async iterable
+        let stopped = false;
+        const { promise: abortPromise, resolve: resolveAbort } =
+          promiseWithResolve<void>();
+        const iterator = newIterator((e) => {
+          stopped = true;
+          resolveAbort();
+          if (e != null) {
+            try {
+              const result = stream.throw?.(e);
+              if (isPromiseLike(result)) {
+                result.then(null, noop);
+              }
+            } catch {
+              /*noop*/
+            }
+          } else {
+            try {
+              const result = stream.return?.();
+              if (isPromiseLike(result)) {
+                result.then(null, noop);
+              }
+            } catch {
+              /*noop*/
+            }
+          }
+        });
+        (async () => {
+          let i = 0;
+          // eslint-disable-next-line no-constant-condition
+          while (true) {
+            const next = await Promise.race([abortPromise, stream.next()]);
+            if (stopped || !next) {
+              break;
+            }
+            if (!next) {
+              iterator.throw(new Error("Invalid iteration")).then(null, noop);
+              break;
+            }
+            const { done, value } = next;
+            if (done) {
+              break;
+            }
+            const payload = await Promise.race([
+              abortPromise,
+              executeStreamPayload(value, i),
+            ]);
+            if (payload === undefined) {
+              break;
+            }
+            if (isAsyncIterable(payload)) {
+              // FIXME: do we need to avoid 'for await' because it can cause the
+              // stream to exit late if we're waiting on a promise and the stream
+              // exits in the interrim? We're assuming that no promises will be
+              // sufficiently long-lived for this to be an issue right now.
+              // TODO: should probably tie all this into an AbortController/signal too
+              for await (const entry of payload) {
+                iterator.push(entry);
+              }
+            } else {
+              iterator.push(payload);
+            }
+            i++;
+          }
+        })()
+          .then(
+            () => iterator.return(),
+            (e) => iterator.throw(e),
+          )
+          .then(null, noop);
+        return iterator;
+      }
+
+      // NOTE: this is the root output plan of a query/mutation operation
       const [ctx, result] = outputBucket(
         operationPlan.rootOutputPlan,
-        subscriptionBucket,
-        ZERO,
+        rootBucket,
+        rootBucketIndex,
         requestContext,
         [],
-        rootBucket.store
-          .get(operationPlan.variableValuesStep.id)!
-          .at(rootBucketIndex),
+        rootBucket.store.get(operationPlan.variableValuesStep.id)!.at(0),
         outputDataAsString,
       );
       return finalize(
         result,
         ctx,
-        index === 0 ? (rootValue[$$extensions] ?? undefined) : undefined,
+        rootValue[$$extensions] ?? undefined,
         outputDataAsString,
       );
     }
+
     if (isPromiseLike(bucketPromise)) {
-      return bucketPromise.then(outputStreamBucket);
+      return bucketPromise.then(output);
     } else {
-      return outputStreamBucket();
+      return output();
     }
-  }
-
-  function output() {
-    // Later we'll need to loop
-
-    // If it's a subscription we need to use the stream
-    const bucketRootEValue =
-      rootBucket.layerPlan.rootStep != null &&
-      rootBucket.layerPlan.rootStep.id != null
-        ? rootBucket.store.get(rootBucket.layerPlan.rootStep.id)!
-        : null;
-    const bucketRootValue = bucketRootEValue?.at(rootBucketIndex);
-    const bucketRootFlags =
-      bucketRootEValue?._flagsAt(rootBucketIndex) ?? NO_FLAGS;
-    if (bucketRootFlags & FLAG_ERROR) {
-      releaseUnusedIterators(rootBucket, rootBucketIndex, null);
-      // Something major went wrong!
-      const errors = [
-        new GraphQLError(
-          bucketRootValue.message,
-          operationPlan.rootOutputPlan.locationDetails.node, // node
-          undefined, // source
-          null, // positions
-          null, // path
-          bucketRootValue, // originalError
-          null, // extensions
-        ),
-      ];
-      const payload = Object.create(null) as ExecutionResult;
-      payload.errors = errors;
-      const extensions = bucketRootValue[$$extensions];
-      if (extensions != null) {
-        payload.extensions = extensions;
-      }
-      return payload;
-    }
-
-    // NOTE: this is where we determine whether to stream or not
-    if (
-      bucketRootValue != null &&
-      subscriptionLayerPlan != null &&
-      Array.isArray(bucketRootValue) &&
-      (bucketRootValue as StreamMaybeMoreableArray)[$$streamMore]
-    ) {
-      // We expect exactly one streamable, we should not need to
-      // `releaseUnusedIterators(rootBucket, rootBucketIndex, null)` here.
-      const arr = bucketRootValue as StreamMoreableArray;
-      const stream = arr[$$streamMore];
-      // Do the async iterable
-      let stopped = false;
-      const { promise: abortPromise, resolve: resolveAbort } =
-        promiseWithResolve<void>();
-      const iterator = newIterator((e) => {
-        stopped = true;
-        resolveAbort();
-        if (e != null) {
-          try {
-            const result = stream.throw?.(e);
-            if (isPromiseLike(result)) {
-              result.then(null, noop);
-            }
-          } catch {
-            /*noop*/
-          }
-        } else {
-          try {
-            const result = stream.return?.();
-            if (isPromiseLike(result)) {
-              result.then(null, noop);
-            }
-          } catch {
-            /*noop*/
-          }
-        }
-      });
-      (async () => {
-        let i = 0;
-        // eslint-disable-next-line no-constant-condition
-        while (true) {
-          const next = await Promise.race([abortPromise, stream.next()]);
-          if (stopped || !next) {
-            break;
-          }
-          if (!next) {
-            iterator.throw(new Error("Invalid iteration")).then(null, noop);
-            break;
-          }
-          const { done, value } = next;
-          if (done) {
-            break;
-          }
-          const payload = await Promise.race([
-            abortPromise,
-            executeStreamPayload(value, i),
-          ]);
-          if (payload === undefined) {
-            break;
-          }
-          if (isAsyncIterable(payload)) {
-            // FIXME: do we need to avoid 'for await' because it can cause the
-            // stream to exit late if we're waiting on a promise and the stream
-            // exits in the interrim? We're assuming that no promises will be
-            // sufficiently long-lived for this to be an issue right now.
-            // TODO: should probably tie all this into an AbortController/signal too
-            for await (const entry of payload) {
-              iterator.push(entry);
-            }
-          } else {
-            iterator.push(payload);
-          }
-          i++;
-        }
-      })()
-        .then(
-          () => iterator.return(),
-          (e) => iterator.throw(e),
-        )
-        .then(null, noop);
-      return iterator;
-    }
-
-    // NOTE: this is the root output plan of a query/mutation operation
-    const [ctx, result] = outputBucket(
-      operationPlan.rootOutputPlan,
-      rootBucket,
-      rootBucketIndex,
-      requestContext,
-      [],
-      rootBucket.store.get(operationPlan.variableValuesStep.id)!.at(0),
-      outputDataAsString,
-    );
-    return finalize(
-      result,
-      ctx,
-      rootValue[$$extensions] ?? undefined,
-      outputDataAsString,
-    );
-  }
-
-  if (isPromiseLike(bucketPromise)) {
-    return bucketPromise.then(output);
-  } else {
-    return output();
-  }
-}
+  });
 
 function establishOperationPlanFromEvent(event: EstablishOperationPlanEvent) {
   return establishOperationPlan(
@@ -598,118 +602,120 @@ export function grafastPrepare(
 ): PromiseOrDirect<
   ExecutionResult | AsyncGenerator<AsyncExecutionResult, void, void>
 > {
-  const {
-    schema,
-    contextValue: context,
-    rootValue = Object.create(null),
-    // operationName,
-    // document,
-    middleware,
-  } = args;
-  const exeContext = buildExecutionContext(args);
+  return startActiveSpan("grafastPrepare", () => {
+    const {
+      schema,
+      contextValue: context,
+      rootValue = Object.create(null),
+      // operationName,
+      // document,
+      middleware,
+    } = args;
+    const exeContext = buildExecutionContext(args);
 
-  // If a list of errors was returned, abort
-  if (Array.isArray(exeContext) || "length" in exeContext) {
-    return Object.assign(Object.create(bypassGraphQLObj), {
-      errors: exeContext,
-      extensions: rootValue[$$extensions],
-    });
-  }
+    // If a list of errors was returned, abort
+    if (Array.isArray(exeContext) || "length" in exeContext) {
+      return Object.assign(Object.create(bypassGraphQLObj), {
+        errors: exeContext,
+        extensions: rootValue[$$extensions],
+      });
+    }
 
-  const { operation, fragments, variableValues } = exeContext;
-  // TODO: update this when GraphQL.js gets support for onError
-  const onError = args.onError ?? "PROPAGATE";
+    const { operation, fragments, variableValues } = exeContext;
+    // TODO: update this when GraphQL.js gets support for onError
+    const onError = args.onError ?? "PROPAGATE";
 
-  let operationPlan!: OperationPlan;
-  try {
-    if (middleware != null) {
-      operationPlan = middleware.runSync(
-        "establishOperationPlan",
-        {
+    let operationPlan!: OperationPlan;
+    try {
+      if (middleware != null) {
+        operationPlan = middleware.runSync(
+          "establishOperationPlan",
+          {
+            schema,
+            operation,
+            fragments,
+            variableValues,
+            context: context as any,
+            rootValue,
+            onError,
+            args,
+            options,
+          },
+          establishOperationPlanFromEvent,
+        );
+      } else {
+        operationPlan = establishOperationPlan(
           schema,
           operation,
           fragments,
           variableValues,
-          context: context as any,
+          context as any,
           rootValue,
           onError,
-          args,
           options,
-        },
-        establishOperationPlanFromEvent,
-      );
-    } else {
-      operationPlan = establishOperationPlan(
-        schema,
-        operation,
-        fragments,
+        );
+      }
+    } catch (error) {
+      const graphqlError =
+        error instanceof GraphQLError
+          ? error
+          : new GraphQLError(
+              error.message,
+              undefined,
+              undefined,
+              undefined,
+              undefined,
+              error,
+              error.extensions ?? null,
+            );
+      return { errors: [graphqlError] };
+    }
+
+    if (
+      options.explain === true ||
+      (options.explain && options.explain.includes("plan"))
+    ) {
+      // Only build the plan once
+      if (operationPlan[$$contextPlanCache] == null) {
+        operationPlan[$$contextPlanCache] = operationPlan.generatePlanJSON();
+      }
+      rootValue[$$extensions]?.explain?.operations.push({
+        type: "plan",
+        title: "Plan",
+        plan: operationPlan[$$contextPlanCache],
+      });
+    }
+
+    const executionTimeout = options.timeouts?.execution ?? null;
+    const abortController = new AbortController();
+    try {
+      const result = executePreemptive(
+        args,
+        operationPlan,
         variableValues,
-        context as any,
+        context,
         rootValue,
         onError,
-        options,
+        options.outputDataAsString ?? false,
+        executionTimeout,
+        abortController.signal,
       );
+      if (isPromiseLike(result)) {
+        return result.then(
+          (v) => handleMaybeIterator(abortController, v),
+          (e) => {
+            abortController.abort(e);
+            throw e;
+          },
+        );
+      } else {
+        return handleMaybeIterator(abortController, result);
+      }
+    } catch (e) {
+      abortController.abort(e);
+      throw e;
     }
-  } catch (error) {
-    const graphqlError =
-      error instanceof GraphQLError
-        ? error
-        : new GraphQLError(
-            error.message,
-            undefined,
-            undefined,
-            undefined,
-            undefined,
-            error,
-            error.extensions ?? null,
-          );
-    return { errors: [graphqlError] };
-  }
-
-  if (
-    options.explain === true ||
-    (options.explain && options.explain.includes("plan"))
-  ) {
-    // Only build the plan once
-    if (operationPlan[$$contextPlanCache] == null) {
-      operationPlan[$$contextPlanCache] = operationPlan.generatePlanJSON();
-    }
-    rootValue[$$extensions]?.explain?.operations.push({
-      type: "plan",
-      title: "Plan",
-      plan: operationPlan[$$contextPlanCache],
-    });
-  }
-
-  const executionTimeout = options.timeouts?.execution ?? null;
-  const abortController = new AbortController();
-  try {
-    const result = executePreemptive(
-      args,
-      operationPlan,
-      variableValues,
-      context,
-      rootValue,
-      onError,
-      options.outputDataAsString ?? false,
-      executionTimeout,
-      abortController.signal,
-    );
-    if (isPromiseLike(result)) {
-      return result.then(
-        (v) => handleMaybeIterator(abortController, v),
-        (e) => {
-          abortController.abort(e);
-          throw e;
-        },
-      );
-    } else {
-      return handleMaybeIterator(abortController, result);
-    }
-  } catch (e) {
-    abortController.abort(e);
-    throw e;
-  }
+  });
 }
 
 interface PushableAsyncGenerator<T> extends AsyncGenerator<T, void, undefined> {

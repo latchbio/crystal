@@ -19,6 +19,7 @@ export {
   resolvePreset,
   resolvePresets,
 } from "./resolvePresets.ts";
+export { makeStartActiveSpan } from "./utils.ts";
 
 export function sortedPlugins(
   plugins: GraphileConfig.Plugin[] | undefined,

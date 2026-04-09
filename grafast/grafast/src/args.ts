@@ -7,6 +7,7 @@ import type {
   PromiseOrDirect,
 } from "./interfaces.ts";
 import { getGrafastMiddleware } from "./middleware.ts";
+import { startActiveSpan } from "./tracer.ts";
 import { isPromiseLike } from "./utils.ts";
 const EMPTY_OBJECT: Record<string, never> = Object.freeze(Object.create(null));
 
@@ -32,42 +33,47 @@ export function hookArgs(
   legacyResolvedPreset?: GraphileConfig.ResolvedPreset,
   legacyCtx?: Partial<Grafast.RequestContext>,
 ): PromiseOrDirect<Grafast.ExecutionArgs> {
-  if (legacyResolvedPreset !== undefined) {
-    rawArgs.resolvedPreset = legacyResolvedPreset;
-  }
-  if (legacyCtx !== undefined) {
-    rawArgs.requestContext = rawArgs.requestContext ?? legacyCtx;
-  }
-  const {
-    middleware: rawMiddleware,
-    resolvedPreset,
-    contextValue: rawContextValue,
-  } = rawArgs;
-  try {
-    (rawContextValue as Record<string | symbol, any>)[$$writeTest] = true;
-  } catch (e) {
-    // Make context mutable
-    rawArgs.contextValue = Object.assign(Object.create(null), rawContextValue);
-  }
-  const middleware =
-    rawMiddleware === undefined && resolvedPreset != null
-      ? getGrafastMiddleware(resolvedPreset)
-      : (rawMiddleware ?? null);
-  if (rawMiddleware === undefined) {
-    rawArgs.middleware = middleware;
-  }
-  const args = rawArgs as Grafast.ExecutionArgs;
-  // Assert that args haven't already been hooked
-  if (args[$$hooked]) {
-    throw new Error("Must not call hookArgs twice!");
-  }
-  args[$$hooked] = true;
+  return startActiveSpan("hookArgs", () => {
+    if (legacyResolvedPreset !== undefined) {
+      rawArgs.resolvedPreset = legacyResolvedPreset;
+    }
+    if (legacyCtx !== undefined) {
+      rawArgs.requestContext = rawArgs.requestContext ?? legacyCtx;
+    }
+    const {
+      middleware: rawMiddleware,
+      resolvedPreset,
+      contextValue: rawContextValue,
+    } = rawArgs;
+    try {
+      (rawContextValue as Record<string | symbol, any>)[$$writeTest] = true;
+    } catch (e) {
+      // Make context mutable
+      rawArgs.contextValue = Object.assign(
+        Object.create(null),
+        rawContextValue,
+      );
+    }
+    const middleware =
+      rawMiddleware === undefined && resolvedPreset != null
+        ? getGrafastMiddleware(resolvedPreset)
+        : rawMiddleware ?? null;
+    if (rawMiddleware === undefined) {
+      rawArgs.middleware = middleware;
+    }
+    const args = rawArgs as Grafast.ExecutionArgs;
+    // Assert that args haven't already been hooked
+    if (args[$$hooked]) {
+      throw new Error("Must not call hookArgs twice!");
+    }
+    args[$$hooked] = true;
 
-  if (middleware != null) {
-    return middleware.run("prepareArgs", { args }, finalizeWithEvent);
-  } else {
-    return finalize(args);
-  }
+    if (middleware != null) {
+      return middleware.run("prepareArgs", { args }, finalizeWithEvent);
+    } else {
+      return finalize(args);
+    }
+  });
 }
 
 function finalize(args: Grafast.ExecutionArgs) {

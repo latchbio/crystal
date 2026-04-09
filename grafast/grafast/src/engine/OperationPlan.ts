@@ -91,6 +91,7 @@ import {
   graphqlResolveType,
 } from "../steps/graphqlResolver.ts";
 import { timeSource } from "../timeSource.ts";
+import { startActiveSpan } from "../tracer.ts";
 import type { Sudo } from "../utils.ts";
 import {
   arraysMatch,
@@ -1402,7 +1403,7 @@ export class OperationPlan {
               rawParentStep: parentStep,
               field: objectField,
               trackedArguments,
-              streamDetails: isList ? (streamDetails ?? false) : null,
+              streamDetails: isList ? streamDetails ?? false : null,
             },
           ));
           fieldLayerPlan.latestSideEffectStep = latestSideEffectStep;
@@ -2086,11 +2087,7 @@ export class OperationPlan {
                 );
                 if (missedPaths.length > 0) {
                   throw new Error(
-                    `When planning ${graphqlType}'s planForType for ${
-                      type.name
-                    }, returned step ${
-                      $stepForType
-                    } is not valid in ${missedPaths.length} out of ${polymorphicPaths.size} expected paths; missed paths: ${missedPaths}`,
+                    `When planning ${graphqlType}'s planForType for ${type.name}, returned step ${$stepForType} is not valid in ${missedPaths.length} out of ${polymorphicPaths.size} expected paths; missed paths: ${missedPaths}`,
                   );
                 }
               }
@@ -5352,12 +5349,15 @@ But ${p} is not in ${winner.layerPlan}'s expected polymorphic paths:
         rootStepId: lp.rootStep ? lp.rootStep.id : null,
       };
     }
-    return {
-      version: "v1",
-      buckets: this.stepTracker.layerPlans
-        .filter((b) => b != null)
-        .map(printBucket),
-    } as GrafastPlanJSONv1;
+
+    return startActiveSpan("OperationPlan.generatePlanJSON", () => {
+      return {
+        version: "v1",
+        buckets: this.stepTracker.layerPlans
+          .filter((b) => b != null)
+          .map(printBucket),
+      } as GrafastPlanJSONv1;
+    });
   }
 
   finishSubroutine(

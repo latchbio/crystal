@@ -556,7 +556,7 @@ export /* abstract */ class Step<TData = any> {
     return this.operationPlan.cacheStep(this, actionKey, cacheKey, cb);
   }
 
-  public toString(): string {
+  public toString(colors = false): string {
     let meta;
     try {
       // If we log out too early, the meta function might fail.
@@ -564,16 +564,20 @@ export /* abstract */ class Step<TData = any> {
     } catch (e) {
       // Ignore
     }
-    return chalk.bold.blue(
-      `${this.constructor.name.replace(/Step$/, "")}${
-        this.layerPlan.id === 0 ? "" : chalk.grey(`{${this.layerPlan.id}}`)
-      }${this._isUnary ? "➊" : ""}${
-        this._stepOptions.stream != null ? "@s" : ""
-      }${meta != null && meta.length ? chalk.grey(`<${meta}>`) : ""}[${inspect(
-        this.id,
-        { colors: true },
-      )}]`,
-    );
+
+    const grey = colors ? chalk.grey : <T>(x: T): T => x;
+
+    const res = `${this.constructor.name.replace(/Step$/, "")}${
+      this.layerPlan.id === 0 ? "" : grey(`{${this.layerPlan.id}}`)
+    }${this._isUnary ? "➊" : ""}${
+      this._stepOptions.stream != null ? "@s" : ""
+    }${meta != null && meta.length ? grey(`<${meta}>`) : ""}[${inspect(
+      this.id,
+      { colors },
+    )}]`;
+    if (!colors) return res;
+
+    return chalk.bold.blue(res);
   }
 
   /**
