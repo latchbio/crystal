@@ -1,5 +1,5 @@
 {
-  "name": "grafserv",
+  "name": "@latchbio/grafserv",
   "version": "1.0.0",
   "description": "A highly optimized server for GraphQL, powered by Grafast",
   "type": "commonjs",
@@ -116,8 +116,8 @@
   "peerDependencies": {
     "@envelop/core": "^5.0.0",
     "@whatwg-node/server": "^0.9.64",
-    "grafast": "workspace:^1.0.0-rc.8",
-    "graphile-config": "workspace:^",
+    "@latchbio/grafast": "workspace:^1.0.0-rc.8",
+    "@latchbio/graphile-config": "workspace:^",
     "graphql": "^16.9.0",
     "h3": "^1.13.0",
     "hono": "^4.6.15",

@@ -1,5 +1,5 @@
 {
-  "name": "@dataplan/pg",
+  "name": "@latchbio/dataplan-pg",
   "version": "1.0.0",
   "description": "PostgreSQL step classes for Grafast",
   "type": "commonjs",
@@ -75,7 +75,7 @@
   "peerDependencies": {
     "@dataplan/json": "workspace:^",
     "grafast": "workspace:^",
-    "graphile-config": "workspace:^1.0.0-rc.5",
+    "@latchbio/graphile-config": "workspace:^1.0.0-rc.5",
     "graphql": "^16.9.0",
     "pg": "^8.7.1",
     "pg-sql2": "workspace:^"
