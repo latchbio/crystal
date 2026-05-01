@@ -411,9 +411,7 @@ export const PgProceduresPlugin: GraphileConfig.Plugin = {
           const namespaceName = namespace.nspname;
           const procName = pgProc.proname;
 
-          // TODO: use smart tags to override this one way or the other?
-          // Perhaps `@forceOrder` or `@ignoreOrder`?
-          const hasImplicitOrder = returnsSetof;
+          const hasImplicitOrder = tags["keepOrder"] === true;
 
           const sqlIdent = info.helpers.pgBasics.identifier(
             namespaceName,
